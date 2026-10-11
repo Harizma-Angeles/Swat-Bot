@@ -1,0 +1,8 @@
+.env
+node_modules/
+data/
+.npm-cache/
+.cache/
+.runtime-home/
+.tmp/
+*.log
