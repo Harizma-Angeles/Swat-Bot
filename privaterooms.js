@@ -82,13 +82,22 @@ module.exports = function createPrivateRooms(client, cfg) {
       const parent = guild.channels.cache.get(categoryId) ?? (await guild.channels.fetch(categoryId).catch(() => null));
       if (!parent) return console.error('Приватные комнаты: категория не найдена, проверьте ID.');
 
-      const channel = await guild.channels.create({
+      const make = (overwrites) => guild.channels.create({
         name: roomName(member),
         type: ChannelType.GuildVoice,
         parent: categoryId,
-        permissionOverwrites: buildOverwrites(parent, member.id),
+        permissionOverwrites: overwrites,
         reason: `Приватная комната для ${member.user.tag}`,
       });
+      let channel;
+      try {
+        channel = await make(buildOverwrites(parent, member.id));
+      } catch (err) {
+        if (err?.code !== 50013) throw err;
+        // Боту нельзя выдавать владельцу права, которых нет у самого бота — создаём комнату только с правами категории
+        console.warn('Приватные комнаты: не удалось выдать владельцу права на комнату (у бота их нет на категории). Создаю комнату с правами категории.');
+        channel = await make(buildOverwrites(parent, member.id).filter((o) => o.id !== member.id));
+      }
       rooms[channel.id] = member.id;
       store.save();
 
@@ -132,6 +141,20 @@ module.exports = function createPrivateRooms(client, cfg) {
   async function init() {
     const guild = client.guilds.cache.get(guildId);
     if (!guild) return;
+    // Диагностика: сразу видно, чего не хватает
+    const parent = guild.channels.cache.get(categoryId) ?? (await guild.channels.fetch(categoryId).catch(() => null));
+    const lobby = guild.channels.cache.get(lobbyId) ?? (await guild.channels.fetch(lobbyId).catch(() => null));
+    if (!parent) console.error('Приватные комнаты: категория', categoryId, 'не найдена (проверьте ID и что бот видит категорию).');
+    if (!lobby) console.error('Приватные комнаты: канал создания', lobbyId, 'не найден (проверьте ID).');
+    else if (lobby.type !== ChannelType.GuildVoice) console.error('Приватные комнаты: канал создания должен быть ГОЛОСОВЫМ, сейчас тип', lobby.type);
+    if (parent) {
+      const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+      const have = me && parent.permissionsFor(me);
+      const need = { 'Просмотр канала': F.ViewChannel, 'Управление каналами': F.ManageChannels, 'Перемещение участников': F.MoveMembers, 'Подключаться': F.Connect };
+      const missing = have ? Object.entries(need).filter(([, f]) => !have.has(f)).map(([n]) => n) : ['(не удалось проверить)'];
+      if (missing.length) console.error('Приватные комнаты: у бота на категории нет прав:', missing.join(', '));
+      else console.log('Приватные комнаты: готово (категория и лобби найдены, права есть).');
+    }
     for (const id of Object.keys(rooms)) {
       const channel = guild.channels.cache.get(id) ?? (await guild.channels.fetch(id).catch(() => null));
       if (!channel) forget(id);
