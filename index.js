@@ -107,6 +107,7 @@ const {
   PermissionsBitField,
   MessageFlags,
   SlashCommandBuilder,
+  AttachmentBuilder,
   Options,
 } = require('discord.js');
 
@@ -164,7 +165,7 @@ const REQUEST_TYPES = {
 const WELCOME_CHANNEL_ID = '1563655522467454996'; // проходная: приветствия и прощания
 
 // Роль, которая выдаётся каждому новому участнику при заходе (пусто — не выдавать)
-const NEWCOMER_ROLE_ID = '';
+const NEWCOMER_ROLE_ID = '1563673859310227496'; // роль «Гость»: выдаётся всем новым участникам, снимается при одобрении заявки
 
 // Доп. роль: должна быть у каждого, у кого есть любая роль ранга (1–10) — это роль «Сотрудник»
 const EXTRA_RANK_ROLE_ID = EMPLOYEE_ROLE_ID;
@@ -207,7 +208,7 @@ function rankFromRoles(member, entry) {
 // =====================================================
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent], // MessageContent — чтобы бот видел текст сообщений для транскриптов тикетов
   allowedMentions: { parse: [] },
   // Длинные таймауты и повторы запросов — бот переживает кратковременные сбои сети хостинга
   rest: { timeout: 30_000, retries: 5 },
@@ -238,6 +239,28 @@ const pendingDeny = new Map(); // messageId -> { moderatorId, until }
 const ephemeral = (content) => ({ content, flags: MessageFlags.Ephemeral });
 const canModerate = (member) =>
   !!member && member.roles.cache.some((r) => MODERATOR_ROLES.includes(r.id));
+const NO_ACCESS_TEXT = '❌ Эта команда доступна только ролям **OP**, **9–10 рангов** и **«*»**.';
+
+// ---------- /say и /fastsay: сообщение от лица бота ----------
+const SAY_ALLOW_EVERYONE = false; // true — разрешить @everyone/@here в сообщениях бота
+async function sendAsBot(i, rawText) {
+  const text = rawText.trim();
+  if (!text) return i.reply(ephemeral('❌ Сообщение не может быть пустым.'));
+  const channel = i.channel ?? (await client.channels.fetch(i.channelId).catch(() => null));
+  if (!channel?.isTextBased()) return i.reply(ephemeral('❌ Не удалось найти канал для отправки.'));
+  try {
+    await channel.send({
+      content: text.slice(0, 2000),
+      allowedMentions: { parse: SAY_ALLOW_EVERYONE ? ['users', 'roles', 'everyone'] : ['users', 'roles'] },
+    });
+  } catch (err) {
+    console.error('Ошибка /say:', err.message);
+    const reason = err.code === 50001 || err.code === 50013 ? 'у бота нет прав писать в этот канал' : 'не удалось отправить сообщение';
+    return i.reply(ephemeral(`❌ ${reason}.`));
+  }
+  console.log(`/say от ${i.user.tag} в #${channel.name ?? i.channelId}: ${text.slice(0, 80).replace(/\s+/g, ' ')}`);
+  return i.reply(ephemeral('✅ Отправлено.'));
+}
 
 // ---------- Отказ работать на чужих серверах ----------
 async function refuseGuild(guild) {
@@ -307,31 +330,33 @@ const commands = [
   new SlashCommandBuilder().setName('ping').setDescription('Проверить задержку бота'),
   new SlashCommandBuilder()
     .setName('addrest')
-    .setDescription('Записать игровой ник игрока в реестр (по нему бот ставит ник «ОТДЕЛ | Ник»)')
+    .setDescription('Записать игрока в реестр: игровой ник и кличку (по ним бот ставит ник «Кличка | Ник [ранг]»)')
     .addUserOption((o) => o.setName('игрок').setDescription('Пинг игрока').setRequired(true))
-    .addStringOption((o) => o.setName('ник').setDescription('Игровой ник, например Nick_Name').setRequired(true).setMaxLength(40))
-    .addStringOption((o) => o.setName('позывной').setDescription('Позывной (необязательно, хранится в реестре)').setRequired(false).setMaxLength(30))
-    .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+    .addStringOption((o) => o.setName('ник').setDescription('Игровой ник, например Nick_Name').setRequired(true).setMaxLength(GAME_NICK_MAX))
+    .addStringOption((o) => o.setName('кличка').setDescription(`Кличка до ${CALLSIGN_MAX} символов (необязательно)`).setRequired(false).setMaxLength(CALLSIGN_MAX)),
+  new SlashCommandBuilder()
+    .setName('say')
+    .setDescription('Отправить сообщение от имени бота (откроется окно, можно в несколько строк)'),
+  new SlashCommandBuilder()
+    .setName('fastsay')
+    .setDescription('Быстро отправить сообщение от имени бота в этот канал')
+    .addStringOption((o) => o.setName('текст').setDescription('Текст сообщения (\\n — перенос строки)').setRequired(true).setMaxLength(2000)),
   new SlashCommandBuilder()
     .setName('restrlist')
-    .setDescription('Показать весь реестр игроков (игровой ник и позывной)')
-    .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+    .setDescription('Показать весь реестр игроков (игровой ник и кличка)'),
   new SlashCommandBuilder()
     .setName('syncnicks')
-    .setDescription('Проверить ники всех игроков из реестра сейчас и показать, кого и почему не удалось изменить')
-    .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+    .setDescription('Проверить ники всех игроков из реестра сейчас и показать, кого и почему не удалось изменить'),
   new SlashCommandBuilder()
     .setName('fastroll')
     .setDescription('Снять у игроков ВСЕ роли и оставить только выбранные')
     .addStringOption((o) => o.setName('игроки').setDescription('Пинги игроков (можно несколько, через пробел)').setRequired(true))
-    .addStringOption((o) => o.setName('роли').setDescription('Какие роли оставить (пинги ролей, можно несколько)').setRequired(true))
-    .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+    .addStringOption((o) => o.setName('роли').setDescription('Какие роли оставить (пинги ролей, можно несколько)').setRequired(true)),
   new SlashCommandBuilder()
     .setName('clearroll')
     .setDescription('Снять роль у игрока')
     .addUserOption((o) => o.setName('игрок').setDescription('Пинг игрока').setRequired(true))
-    .addRoleOption((o) => o.setName('роль').setDescription('Какую роль снять').setRequired(true))
-    .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+    .addRoleOption((o) => o.setName('роль').setDescription('Какую роль снять').setRequired(true)),
 ];
 
 const metaStore = makeStore(path.join(DATA_DIR, 'meta.json'), () => ({}));
@@ -742,31 +767,63 @@ client.on('interactionCreate', async (i) => {
       return await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 
-    // /addrest (только администраторы)
+    // /say и /fastsay — сообщение от лица бота (OP / 9–10 ранги / «*»)
+    if (i.isChatInputCommand() && i.commandName === 'say') {
+      if (!canModerate(i.member)) return await i.reply(ephemeral(NO_ACCESS_TEXT));
+      const modal = new ModalBuilder()
+        .setCustomId('say_modal')
+        .setTitle('Сообщение от лица бота')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('text')
+              .setLabel('Текст сообщения')
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('Можно в несколько строк. Работают эмодзи, **markdown**, пинги <@id> / <@&id>, ссылки.')
+              .setRequired(true)
+              .setMaxLength(2000)
+          )
+        );
+      return await i.showModal(modal);
+    }
+    if (i.isModalSubmit() && i.customId === 'say_modal') {
+      if (!canModerate(i.member)) return await i.reply(ephemeral(NO_ACCESS_TEXT));
+      return await sendAsBot(i, i.fields.getTextInputValue('text'));
+    }
+    if (i.isChatInputCommand() && i.commandName === 'fastsay') {
+      if (!canModerate(i.member)) return await i.reply(ephemeral(NO_ACCESS_TEXT));
+      return await sendAsBot(i, i.options.getString('текст', true).replace(/\\n/g, '\n'));
+    }
+
+    // /addrest (OP / 9–10 ранги / «*»)
     if (i.isChatInputCommand() && i.commandName === 'addrest') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта команда доступна только администраторам.'));
-      }
+      if (!canModerate(i.member)) return await i.reply(ephemeral(NO_ACCESS_TEXT));
       const target = i.options.getUser('игрок', true);
       const nick = i.options.getString('ник', true).trim();
       if (!nick) return await i.reply(ephemeral('❌ Ник не может быть пустым.'));
-      const callsignOpt = i.options.getString('позывной')?.trim();
+      const callsignOpt = i.options.getString('кличка')?.trim();
+      if (callsignOpt && callsignOpt.length > CALLSIGN_MAX) {
+        return await i.reply(ephemeral(`❌ Кличка слишком длинная (максимум ${CALLSIGN_MAX} символов).`));
+      }
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
       saveNick(target.id, nick, callsignOpt || undefined);
       const entry = getEntry(target.id);
-      await i.reply(
-        ephemeral(
-          `✅ Игрок <@${target.id}> записан в реестр: **${nick}**` + (entry.callsign ? `, позывной **${entry.callsign}**.` : '.') + '\nНик на сервере будет приведён к форме «ПРИСТАВКА | Ник».'
-        )
-      );
       const m = await i.guild.members.fetch(target.id).catch(() => null);
-      if (m) await syncMemberNick(m);
+      const status = m ? await syncMemberNick(m) : 'left';
+      const statusText = status === 'left' ? 'игрока нет на сервере' : SYNC_STATUS_TEXT[status] ?? status;
+      let text =
+        `✅ Игрок <@${target.id}> записан в реестр: **${nick}**` +
+        (entry.callsign ? `, кличка **${entry.callsign}**.` : '.') +
+        `\n🏷️ Ник на сервере: ${statusText}.`;
+      if (!entry.callsign) text += '\n⚠️ Кличка не указана — пока её нет, ник «Кличка | Ник [ранг]» поставить нельзя. Добавьте: `/addrest` с полем «кличка».';
+      await i.editReply({ content: text, allowedMentions: { parse: [] } });
       return await updateRoster();
     }
 
     // /restrlist (только администраторы)
     if (i.isChatInputCommand() && i.commandName === 'restrlist') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта команда доступна только администраторам.'));
+      if (!canModerate(i.member)) {
+        return await i.reply(ephemeral(NO_ACCESS_TEXT));
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       await loadMembers(i.guild);
@@ -780,7 +837,7 @@ client.on('interactionCreate', async (i) => {
         const e = getEntry(id);
         const onServer = i.guild.members.cache.has(id);
         return (
-          `**${idx + 1}.** <@${id}> — ${e.nick ? `\`${e.nick}\`` : '*нет ника*'}${e.callsign ? ` — позывной **${e.callsign}**` : ''}` +
+          `**${idx + 1}.** <@${id}> — ${e.nick ? `\`${e.nick}\`` : '*нет ника*'}${e.callsign ? ` — кличка **${e.callsign}**` : ''}` +
           (onServer ? '' : ' 🚪')
         );
       });
@@ -816,8 +873,8 @@ client.on('interactionCreate', async (i) => {
 
     // /syncnicks (только администраторы)
     if (i.isChatInputCommand() && i.commandName === 'syncnicks') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта команда доступна только администраторам.'));
+      if (!canModerate(i.member)) {
+        return await i.reply(ephemeral(NO_ACCESS_TEXT));
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       await loadMembers(i.guild);
@@ -856,11 +913,11 @@ client.on('interactionCreate', async (i) => {
           { name: `🚪 Нет на сервере (${groups.left.length})`, value: list(groups.left) },
           {
             name: `👥 Не в реестре, но с ролью ранга/«Друга организации» (${unregRoles.length})`,
-            value: names(unregRoles) + (unregRoles.length ? '\nДобавьте: `/addrest` игрок ник' : ''),
+            value: names(unregRoles) + (unregRoles.length ? '\nДобавьте: `/addrest` игрок ник кличка' : ''),
           },
           { name: '🔎 Проверено всего', value: `Участников (без ботов): ${i.guild.members.cache.filter((m) => !m.user.bot).size} • в реестре: ${Object.keys(nicks).length} • без записи: ${unreg.length}${adopted ? ` • добавлено по нику: ${adopted}` : ''}` }
         )
-        .setFooter({ text: 'Ник добавляется командой /addrest игрок ник' });
+        .setFooter({ text: 'Игрок добавляется командой /addrest игрок ник кличка' });
       const buttons = [];
       if (groups['no-nick'].length) {
         buttons.push(new ButtonBuilder().setCustomId('fill_callsigns').setLabel('Заполнить ники').setStyle(ButtonStyle.Primary).setEmoji('✏️'));
@@ -874,8 +931,8 @@ client.on('interactionCreate', async (i) => {
 
     // Кнопка «Добавить ники в реестр» — для тех, кого ещё нет в реестре (только администраторы)
     if (i.isButton() && i.customId === 'add_nicks') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта кнопка доступна только администраторам.'));
+      if (!canModerate(i.member)) {
+        return await i.reply(ephemeral(NO_ACCESS_TEXT));
       }
       await loadMembers(i.guild);
       const candidates = unregisteredMembers(i.guild).filter((m) => nickPrefix(m));
@@ -902,8 +959,8 @@ client.on('interactionCreate', async (i) => {
 
     // Отправка таблицы «Добавить ники в реестр» (только администраторы)
     if (i.isModalSubmit() && i.customId === 'add_nicks_modal') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта функция доступна только администраторам.'));
+      if (!canModerate(i.member)) {
+        return await i.reply(ephemeral(NO_ACCESS_TEXT));
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       await loadMembers(i.guild);
@@ -949,8 +1006,8 @@ client.on('interactionCreate', async (i) => {
 
     // Кнопка «Заполнить ники» (только администраторы)
     if (i.isButton() && i.customId === 'fill_callsigns') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта кнопка доступна только администраторам.'));
+      if (!canModerate(i.member)) {
+        return await i.reply(ephemeral(NO_ACCESS_TEXT));
       }
       const missing = Object.keys(nicks).filter((id) => !getEntry(id)?.nick);
       if (!missing.length) return await i.reply(ephemeral('✅ У всех игроков из реестра уже указан игровой ник.'));
@@ -974,8 +1031,8 @@ client.on('interactionCreate', async (i) => {
 
     // Отправка таблицы ников (только администраторы)
     if (i.isModalSubmit() && i.customId === 'callsigns_modal') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта функция доступна только администраторам.'));
+      if (!canModerate(i.member)) {
+        return await i.reply(ephemeral(NO_ACCESS_TEXT));
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       await loadMembers(i.guild);
@@ -1030,8 +1087,8 @@ client.on('interactionCreate', async (i) => {
 
     // /fastroll (только администраторы)
     if (i.isChatInputCommand() && i.commandName === 'fastroll') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта команда доступна только администраторам.'));
+      if (!canModerate(i.member)) {
+        return await i.reply(ephemeral(NO_ACCESS_TEXT));
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -1099,8 +1156,8 @@ client.on('interactionCreate', async (i) => {
 
     // /clearroll (только администраторы)
     if (i.isChatInputCommand() && i.commandName === 'clearroll') {
-      if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return await i.reply(ephemeral('❌ Эта команда доступна только администраторам.'));
+      if (!canModerate(i.member)) {
+        return await i.reply(ephemeral(NO_ACCESS_TEXT));
       }
       const target = i.options.getUser('игрок', true);
       const role = i.options.getRole('роль', true);
@@ -1551,7 +1608,7 @@ async function finishRequest(i, { ok, title, verdict, reason, dmOk, nick }) {
 // ===================== ТИКЕТЫ =====================
 const TICKET_PANEL_CHANNEL_ID = '1563661934547439757'; // тикеты: канал с кнопками
 const TICKET_CATEGORY_ID = '1563668635719958629'; // раздел, где создаются тикеты
-const TICKET_LOG_CHANNEL_ID = '1563662242413678593'; // канал уведомлений: логи тикетов
+const TICKET_LOG_CHANNEL_ID = '1563766746391777411'; // канал логов тикетов (события + транскрипты)
 const TICKET_STAFF_ROLES = [OP_ROLE_ID, RANK_ROLES[9], RANK_ROLES[10]]; // пингуются и работают с кнопками
 const TICKET_EXTRA_ID = STAR_ROLE_ID; // роль «*» тоже работает с тикетами (не пингуется)
 
@@ -1617,13 +1674,93 @@ async function ensureTicketPanel() {
   }
 }
 
-async function ticketLog(embed) {
+async function ticketLog(embed, files) {
   try {
     const ch = await client.channels.fetch(TICKET_LOG_CHANNEL_ID);
-    await ch.send({ embeds: [embed], allowedMentions: { parse: [] } });
+    await ch.send({ embeds: [embed], ...(files?.length ? { files } : {}), allowedMentions: { parse: [] } });
   } catch (err) {
     console.error('Не удалось записать лог тикета:', err.message);
   }
+}
+
+// ---------- Транскрипт тикета (читаемый .txt, время по МСК) ----------
+const mskFmt = new Intl.DateTimeFormat('ru-RU', { timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+function fmtMsk(ms) {
+  const p = Object.fromEntries(mskFmt.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return `${p.day}.${p.month}.${p.year} ${p.hour}:${p.minute}:${p.second}`;
+}
+const fmtSpan = (ms) => {
+  const m = Math.max(0, Math.round(ms / 60000));
+  const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mi = m % 60;
+  return [d && `${d} д`, h && `${h} ч`, `${mi} мин`].filter(Boolean).join(' ');
+};
+const TRANSCRIPT_MAX_MESSAGES = 3000;
+
+/** Собирает всю переписку канала тикета и возвращает { text, count, truncated }. */
+async function buildTicketTranscript(chId, ticket, closedBy, reason) {
+  const ch = await client.channels.fetch(chId).catch(() => null);
+  if (!ch?.messages) return null;
+  const all = [];
+  let before;
+  while (all.length < TRANSCRIPT_MAX_MESSAGES) {
+    const batch = await withRetry(() => ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) }));
+    if (!batch.size) break;
+    all.push(...batch.values());
+    before = batch.last().id;
+    if (batch.size < 100) break;
+  }
+  const truncated = all.length >= TRANSCRIPT_MAX_MESSAGES;
+  all.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+  const guild = ch.guild;
+  const nameOf = (u) => guild.members.cache.get(u.id)?.displayName ?? u.globalName ?? u.username;
+  const roleTag = (u) => {
+    const m = guild.members.cache.get(u.id);
+    if (u.bot) return ' [БОТ]';
+    if (m && canUseTicket(m)) return ' [АДМИНИСТРАЦИЯ]';
+    if (u.id === ticket.userId) return ' [АВТОР]';
+    return '';
+  };
+  const indent = (t) => t.split('\n').map((l) => `    ${l}`).join('\n');
+  const line = '═'.repeat(60);
+  const T = ticketTypeOf(ticket.type);
+  const who = (id) => { const u = client.users.cache.get(id) ?? guild.members.cache.get(id)?.user; return u ? `${nameOf(u)} (@${u.username}, ${id})` : id; };
+
+  const out = [
+    line,
+    `ТРАНСКРИПТ ТИКЕТА ${ticket.name}`,
+    line,
+    `Тип:               ${T.label}`,
+    `Автор:             ${who(ticket.userId)}`,
+    `Взял в работу:     ${ticket.claimedBy ? who(ticket.claimedBy) : '— (никто)'}`,
+    `Закрыл:            ${who(closedBy)}`,
+    `Причина закрытия:  ${reason}`,
+    `Открыт:            ${fmtMsk(ticket.createdAt)} (МСК)`,
+    `Закрыт:            ${fmtMsk(ticket.closedAt ?? Date.now())} (МСК)`,
+    `Длительность:      ${fmtSpan((ticket.closedAt ?? Date.now()) - ticket.createdAt)}`,
+    `Сообщений:         ${all.length}${truncated ? ` (показаны последние ${TRANSCRIPT_MAX_MESSAGES})` : ''}`,
+    line,
+    '',
+  ];
+
+  for (const m of all) {
+    if (m.system) continue;
+    out.push(`[${fmtMsk(m.createdTimestamp)}] ${nameOf(m.author)}${roleTag(m.author)}:`);
+    const body = [];
+    if (m.cleanContent?.trim()) body.push(m.cleanContent.trim());
+    for (const e of m.embeds) {
+      const parts = [];
+      if (e.title) parts.push(`■ ${e.title}`);
+      if (e.description) parts.push(e.description);
+      for (const f of e.fields ?? []) parts.push(`${f.name.replace(/\*\*/g, '')}: ${f.value}`);
+      if (parts.length) body.push(parts.join('\n'));
+    }
+    for (const a of m.attachments.values()) body.push(`📎 Файл: ${a.name} — ${a.url}`);
+    if (m.stickers?.size) body.push(`🏷️ Стикер: ${[...m.stickers.values()].map((x) => x.name).join(', ')}`);
+    out.push(body.length ? indent(body.join('\n')) : '    (пустое сообщение)', '');
+  }
+  out.push(line, 'Конец транскрипта', line);
+  return { text: out.join('\n'), count: all.length, truncated };
 }
 
 const ticketName = (n, type = 'complaint') => `ticket-${ticketTypeOf(type).slug}-${String(n).padStart(4, '0')}`;
@@ -1925,34 +2062,50 @@ async function handleTicketCloseSubmit(i) {
       }
     }
 
-    // ЛС автору тикета
-    const dmOk = await sendDM(ticket.userId, {
-      embeds: [
-        new EmbedBuilder()
-          .setColor(COLORS.no)
-          .setTitle('🔒 Ваш тикет закрыт')
-          .setDescription(
-            `Ваш тикет **${ticket.name}** был закрыт администратором <@${i.user.id}> (\`${i.user.id}\`) по причине: ${reason}`
-          )
-          .setTimestamp(),
-      ],
-    });
+    // ЛС автору и транскрипт собираем одновременно; удаление канала ждёт, пока лог не будет записан
+    const finish = (async () => {
+      const [dmOk, transcript] = await Promise.all([
+        sendDM(ticket.userId, {
+          embeds: [
+            new EmbedBuilder()
+              .setColor(COLORS.no)
+              .setTitle('🔒 Ваш тикет закрыт')
+              .setDescription(
+                `Ваш тикет **${ticket.name}** был закрыт администратором <@${i.user.id}> (\`${i.user.id}\`) по причине: ${reason}`
+              )
+              .setTimestamp(),
+          ],
+        }),
+        buildTicketTranscript(chId, ticket, i.user.id, reason).catch((err) => {
+          console.error('Не удалось собрать транскрипт:', err.message);
+          return null;
+        }),
+      ]);
 
-    await ticketLog(
-      new EmbedBuilder()
+      const T = ticketTypeOf(ticket.type);
+      const embed = new EmbedBuilder()
         .setColor(COLORS.no)
         .setTitle(`🔒 Тикет закрыт — ${ticket.name}`)
         .addFields(
-          { name: 'Закрыл', value: `<@${i.user.id}> (\`${i.user.id}\`)`, inline: true },
+          { name: 'Тип', value: `${T.emoji} ${T.label}`, inline: true },
           { name: 'Автор', value: `<@${ticket.userId}>`, inline: true },
+          { name: 'Взял', value: ticket.claimedBy ? `<@${ticket.claimedBy}>` : '—', inline: true },
+          { name: 'Закрыл', value: `<@${i.user.id}> (\`${i.user.id}\`)`, inline: true },
+          { name: 'Длительность', value: fmtSpan(ticket.closedAt - ticket.createdAt), inline: true },
+          { name: 'Сообщений', value: transcript ? String(transcript.count) : '—', inline: true },
           { name: 'ЛС автору', value: dmOk ? '✅ доставлено' : '❌ закрыты личные сообщения', inline: true },
-          { name: 'Причина', value: reason }
+          { name: 'Причина закрытия', value: reason.slice(0, 1000) }
         )
-        .setTimestamp()
-    );
+        .setFooter({ text: transcript ? 'Транскрипт — во вложении (.txt)' : 'Транскрипт собрать не удалось' })
+        .setTimestamp();
+      const files = transcript ? [new AttachmentBuilder(Buffer.from(transcript.text, 'utf8'), { name: `${ticket.name}-transcript.txt` })] : [];
+      await ticketLog(embed, files);
+    })().catch((err) => console.error('Ошибка при логировании закрытия тикета:', err.message));
 
     setTimeout(() => {
-      deleteTicketChannel(chId, `Тикет закрыт: ${i.user.tag}`).finally(() => ticketLocks.delete(chId));
+      finish
+        .then(() => deleteTicketChannel(chId, `Тикет закрыт: ${i.user.tag}`))
+        .finally(() => ticketLocks.delete(chId));
     }, 10_000);
   } catch (err) {
     console.error('Ошибка закрытия тикета:', err);
@@ -1965,7 +2118,7 @@ async function handleTicketCloseSubmit(i) {
 // Сюда пишутся логи наказаний (ID канала). Пусто — логов в канал не будет.
 const MOD_LOG_CHANNEL_ID = '';
 // Кто может пользоваться командами модерации (кроме администраторов сервера)
-const MOD_COMMAND_ROLES = [OP_ROLE_ID]; // команды модерации — как раньше, только OP (кнопки — см. BUTTON_ROLES)
+const MOD_COMMAND_ROLES = BUTTON_ROLES; // команды модерации: OP, 9–10 ранги, «*»
 
 const DAY = 864e5;
 const MAX_TIMEOUT_MS = 28 * DAY - 60_000; // лимит Discord на один тайм-аут; длинные муты продлеваются автоматически
@@ -2123,7 +2276,7 @@ const dmField = (ok) => ({ name: '✉️ Уведомление в ЛС', value:
 
 // ---------- Проверки ----------
 function canRunMod(i) {
-  return !!i.member && (i.memberPermissions?.has(PermissionsBitField.Flags.Administrator) || i.member.roles.cache.some((r) => MOD_COMMAND_ROLES.includes(r.id)));
+  return !!i.member && i.member.roles.cache.some((r) => MOD_COMMAND_ROLES.includes(r.id));
 }
 /** Возвращает текст ошибки или null. member — GuildMember цели (если на сервере). */
 function checkTarget(i, user, member, { needMember = true } = {}) {
@@ -2513,6 +2666,9 @@ async function start() {
       return await client.login(token);
     } catch (err) {
       if (!isNetworkError(err)) {
+        if (/disallowed intents/i.test(err.message)) {
+          console.error('❌ Не включён «Message Content Intent». Откройте discord.com/developers/applications → ваш бот → Bot → Privileged Gateway Intents → включите MESSAGE CONTENT INTENT (и SERVER MEMBERS INTENT) → Save, затем перезапустите бота. Он нужен для транскриптов тикетов.');
+        }
         console.error('Не удалось войти в Discord:', err.message);
         process.exit(1);
       }

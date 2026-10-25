@@ -265,19 +265,27 @@ module.exports = function createBriefing(client, cfg) {
   async function writePanel(staleMessage) {
     const ch = await channel(ids.setupChannel);
     if (!ch) throw new Error('Брифинг: канал настройки недоступен.');
-    const recent = await ch.messages.fetch({ limit: 100 });
-    let msg = S.panelMsgId ? await fetchMessage(ch, S.panelMsgId) : null;
-    if (!isPanel(msg)) msg = recent.find(isPanel) ?? (isPanel(staleMessage) ? staleMessage : null);
     const phase = S.phase;
     const payload = { content: '', ...panelPayload() };
-    if (msg) await msg.edit(payload);
-    else msg = await ch.send(payload);
-    S.panelMsgId = msg.id; persist();
-    const duplicates = new Map([...recent.values()].filter(isPanel).map((m) => [m.id, m]));
-    if (isPanel(staleMessage)) duplicates.set(staleMessage.id, staleMessage);
-    for (const old of duplicates.values()) {
-      if (old.id === msg.id || !old.components.length) continue;
-      await old.edit({ content: 'Актуальная панель: https://discord.com/channels/' + guildId + '/' + ids.setupChannel + '/' + msg.id, components: [] });
+    let msg = null;
+    // Быстрый путь: редактируем сообщение по сохранённому ID без предварительных запросов
+    if (S.panelMsgId) {
+      try { msg = await ch.messages.edit(S.panelMsgId, payload); }
+      catch (e) { if (e.code !== 10008 && e.code !== 50005) throw e; }
+    }
+    // Медленный путь (только если панель потеряна): ищем среди последних сообщений и чистим дубли
+    if (!msg) {
+      const recent = await ch.messages.fetch({ limit: 100 });
+      const found = recent.find(isPanel) ?? (isPanel(staleMessage) ? staleMessage : null);
+      msg = found ? await found.edit(payload) : await ch.send(payload);
+      S.panelMsgId = msg.id; persist();
+      const duplicates = new Map([...recent.values()].filter(isPanel).map((m) => [m.id, m]));
+      if (isPanel(staleMessage)) duplicates.set(staleMessage.id, staleMessage);
+      await Promise.all([...duplicates.values()].filter((old) => old.id !== msg.id && old.components.length).map((old) =>
+        old.edit({ content: 'Актуальная панель: https://discord.com/channels/' + guildId + '/' + ids.setupChannel + '/' + msg.id, components: [] }).catch(() => {})));
+    } else if (staleMessage && staleMessage.id !== msg.id && isPanel(staleMessage) && staleMessage.components.length) {
+      // Нажали кнопку на старой панели — отправляем человека на актуальную
+      await staleMessage.edit({ content: 'Актуальная панель: https://discord.com/channels/' + guildId + '/' + ids.setupChannel + '/' + msg.id, components: [] }).catch(() => {});
     }
     lastPanelPhase = phase;
   }
@@ -288,16 +296,23 @@ module.exports = function createBriefing(client, cfg) {
     if (!ch) throw new Error('Брифинг: канал управления недоступен.');
     const payload = controlPayload();
     const signature = JSON.stringify(payload);
-    let msg = S.controlMsgId ? await fetchMessage(ch, S.controlMsgId) : null;
-    if (msg && isPanel(msg)) msg = null;
-    if (msg) {
-      if (controlDirty || controlSignature !== signature) await msg.edit(payload);
-    } else {
+    const id = S.controlMsgId && S.controlMsgId !== S.panelMsgId ? S.controlMsgId : null;
+    let exists = false;
+    if (id) {
+      if (controlDirty || controlSignature !== signature) {
+        // Редактируем сразу, без предварительной загрузки сообщения
+        try { await ch.messages.edit(id, payload); exists = true; }
+        catch (e) { if (e.code !== 10008 && e.code !== 50005) throw e; }
+      } else {
+        exists = !!(await fetchMessage(ch, id)); // плановая проверка, что сообщение не удалили
+      }
+    }
+    if (!exists) {
       if (withPing || S.controlPingPending) {
         payload.content = controllerRoleIds.map((r) => '<@&' + r + '>').join(' ');
         payload.allowedMentions = { roles: controllerRoleIds, users: [] };
       }
-      msg = await ch.send(payload);
+      const msg = await ch.send(payload);
       S.controlMsgId = msg.id;
     }
     delete S.controlPingPending;
@@ -482,15 +497,15 @@ module.exports = function createBriefing(client, cfg) {
     S.muted = false;
     S.deafened = false;
     S.absMarks = {};
+    absCache.clear();
     armReminders();
     persist();
 
-    const msg = await newsSend({ content: '@everyone', embeds: [announceEmbed(startAt)] });
+    // Объявление и мероприятие создаются одновременно; ответ и панель — тоже
+    const [msg] = await Promise.all([newsSend({ content: '@everyone', embeds: [announceEmbed(startAt)] }), createEvent(startAt)]);
     S.announceMsgId = msg?.id ?? null;
-    await createEvent(startAt);
     persist();
-    await syncPanel();
-    await i.editReply({ content: `✅ Брифинг назначен на **${fmtFull(startAt)}**.` });
+    await Promise.all([syncPanel(), i.editReply({ content: `✅ Брифинг назначен на **${fmtFull(startAt)}**.` })]);
   }
   async function handleNo(i) {
     delete S.pending;
@@ -537,23 +552,24 @@ module.exports = function createBriefing(client, cfg) {
     S.startAt = ms;
     armReminders();
     persist();
-    await editEvent({ scheduledStartTime: new Date(ms) });
-    // Прошлые напоминания уже неактуальны
-    await deleteReminders();
     const announce = S.announceMsgId;
-    await newsSend({
-      content: '@everyone',
-      embeds: [
-        new EmbedBuilder()
-          .setColor(colors.warn)
-          .setTitle('🔄 Время брифинга изменено')
-          .setDescription(`Было: ~~${fmtFull(old)}~~\nСтало: **${fmtFull(ms)}**\n<t:${unix(ms)}:R>`)
-          .setTimestamp(),
-      ],
-      ...(announce ? { reply: { messageReference: announce, failIfNotExists: false } } : {}),
-    });
-    await syncPanel();
-    await i.editReply({ content: `✅ Брифинг перенесён на **${fmtFull(ms)}**.` });
+    // Событие, удаление старых напоминаний и объявление о переносе — одновременно (прошлые напоминания уже неактуальны)
+    await Promise.all([
+      editEvent({ scheduledStartTime: new Date(ms) }),
+      deleteReminders(),
+      newsSend({
+        content: '@everyone',
+        embeds: [
+          new EmbedBuilder()
+            .setColor(colors.warn)
+            .setTitle('🔄 Время брифинга изменено')
+            .setDescription(`Было: ~~${fmtFull(old)}~~\nСтало: **${fmtFull(ms)}**\n<t:${unix(ms)}:R>`)
+            .setTimestamp(),
+        ],
+        ...(announce ? { reply: { messageReference: announce, failIfNotExists: false } } : {}),
+      }),
+    ]);
+    await Promise.all([syncPanel(), i.editReply({ content: `✅ Брифинг перенесён на **${fmtFull(ms)}**.` })]);
   }
 
   // ---------- Откат ----------
@@ -582,15 +598,16 @@ module.exports = function createBriefing(client, cfg) {
     const reason = i.fields.getTextInputValue('reason').trim();
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     const announce = S.announceMsgId;
-    await newsSend({
-      content: reason ? `@everyone брифинг отменен! Причина: ${reason}` : '@everyone брифинг отменен!',
-      ...(announce ? { reply: { messageReference: announce, failIfNotExists: false } } : {}),
-    });
-    await deleteReminders();
-    await deleteEvent();
+    await Promise.all([
+      newsSend({
+        content: reason ? `@everyone брифинг отменен! Причина: ${reason}` : '@everyone брифинг отменен!',
+        ...(announce ? { reply: { messageReference: announce, failIfNotExists: false } } : {}),
+      }),
+      deleteReminders(),
+      deleteEvent(),
+    ]);
     resetToIdle();
-    await syncPanel();
-    await i.editReply({ content: '✅ Брифинг отменён.' });
+    await Promise.all([syncPanel(), i.editReply({ content: '✅ Брифинг отменён.' })]);
   }
 
   function resetToIdle() {
@@ -612,12 +629,14 @@ module.exports = function createBriefing(client, cfg) {
     if (!S.reminderIds.length) return;
     const ch = await news();
     if (!ch) throw new Error('Брифинг: канал новостей недоступен.');
-    for (const id of [...S.reminderIds]) {
-      try { await ch.messages.delete(id); }
-      catch (e) { if (e.code !== 10008) throw e; }
-      S.reminderIds = S.reminderIds.filter((v) => v !== id);
-      persist();
-    }
+    const list = [...S.reminderIds];
+    const results = await Promise.allSettled(list.map((id) => ch.messages.delete(id)));
+    const failed = [];
+    results.forEach((r, k) => { if (r.status === 'rejected' && r.reason?.code !== 10008) failed.push(list[k]); });
+    S.reminderIds = S.reminderIds.filter((v) => !list.includes(v) || failed.includes(v));
+    persist();
+    const firstError = results.find((r, k) => r.status === 'rejected' && failed.includes(list[k]));
+    if (firstError) throw firstError.reason;
   }
 
   // ---------- Таймер: напоминания и переход «пора начинать» ----------
@@ -633,8 +652,7 @@ module.exports = function createBriefing(client, cfg) {
           S.phase = 'ready';
           S.controlPingPending = true; controlDirty = true;
           persist();
-          await syncPanel();
-          await sendControl(true);
+          await Promise.all([syncPanel(), sendControl(true)]); // панель и кнопка «Начать» появляются одновременно
         } else if (left <= 5 * 60_000 && !S.fiveSent) {
           S.fiveSent = true;
           S.hourSent = true;
@@ -675,11 +693,14 @@ module.exports = function createBriefing(client, cfg) {
     S.present = {};
     for (const m of humansInBrief()) S.present[m.id] = { at: S.startedAt, onStart: true, sessions: [{ in: S.startedAt, out: null }] };
     persist();
-    await deleteReminders();
-    await newsSend({ content: '@everyone Брифинг начался!' });
-    await editEvent({ status: GuildScheduledEventStatus.Active });
-    await syncPanel();
-    await editControl();
+    // Всё независимое — одновременно; кнопки управления обновляются первыми по скорости, а не в хвосте очереди
+    await Promise.all([
+      editControl(),
+      syncPanel(),
+      newsSend({ content: '@everyone Брифинг начался!' }),
+      deleteReminders(),
+      editEvent({ status: GuildScheduledEventStatus.Active }),
+    ]);
   }
 
   // Сессии присутствия: [{ in, out }], out = null — человек всё ещё в канале.
@@ -766,12 +787,12 @@ module.exports = function createBriefing(client, cfg) {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     Object.assign(S, flags);
     persist();
-    let n = 0;
-    for (const m of humansInBrief()) {
-      if (isController(m)) continue;
-      await m.edit(data).then(() => n++).catch(() => {});
-      await sleep(120);
-    }
+    const targets = humansInBrief().filter((m) => !isController(m));
+    // Тем, у кого уже нужное состояние, запрос не отправляем
+    const need = targets.filter((m) =>
+      ('mute' in data ? !!m.voice.serverMute !== data.mute : false) || ('deaf' in data ? !!m.voice.serverDeaf !== data.deaf : false));
+    const res = await Promise.allSettled(need.map((m) => m.edit(data)));
+    const n = targets.length - res.filter((r) => r.status === 'rejected').length;
     await i.editReply({ content: `✅ ${label}: ${n} чел.` });
   }
 
@@ -780,6 +801,8 @@ module.exports = function createBriefing(client, cfg) {
   const isOkEmoji = (e) => e?.name === OK_EMOJI;
   let syncing = false;
   let syncAgain = false;
+  // Кэш: id сообщения → { count, approved }. Список ✅ перезапрашиваем, только если число реакций изменилось.
+  const absCache = new Map();
 
   /** Читает канал неявок (только сообщения после назначения брифинга) → { userId: messageId }. Ставит/убирает ✅ бота. */
   async function syncAbsences(until) {
@@ -801,17 +824,21 @@ module.exports = function createBriefing(client, cfg) {
           if (!authorId) continue;
           const ok = (msg.reactions ?? []).find((r) => isOkEmoji(r.emoji));
           let approved = false;
-          if (ok) {
+          const cached = ok ? absCache.get(msg.id) : null;
+          if (ok && cached && cached.count === ok.count) {
+            approved = cached.approved;
+          } else if (ok) {
             const users = await client.rest.get(Routes.channelMessageReaction(ids.absenceChannel, msg.id, encodeURIComponent(OK_EMOJI)), { query: new URLSearchParams({ limit: '100' }) });
             for (const u of users) {
               if (u.id === client.user.id) continue;
               if (controllerUserIds.includes(u.id) || controllerRoleIds.some((rid) => guild.members.cache.get(u.id)?.roles.cache.has(rid))) { approved = true; break; }
             }
-          }
+            absCache.set(msg.id, { count: ok.count, approved });
+          } else absCache.delete(msg.id);
           if (approved) result[authorId] = msg.id;
           const mine = !!ok?.me;
-          if (approved && !mine) await client.rest.put(Routes.channelMessageOwnReaction(ids.absenceChannel, msg.id, encodeURIComponent(OK_EMOJI))).catch(() => {});
-          if (!approved && mine) await client.rest.delete(Routes.channelMessageOwnReaction(ids.absenceChannel, msg.id, encodeURIComponent(OK_EMOJI))).catch(() => {});
+          if (approved && !mine) { absCache.delete(msg.id); await client.rest.put(Routes.channelMessageOwnReaction(ids.absenceChannel, msg.id, encodeURIComponent(OK_EMOJI))).catch(() => {}); }
+          if (!approved && mine) { absCache.delete(msg.id); await client.rest.delete(Routes.channelMessageOwnReaction(ids.absenceChannel, msg.id, encodeURIComponent(OK_EMOJI))).catch(() => {}); }
         }
         if (msgs.length < 100) break;
       }
@@ -830,6 +857,8 @@ module.exports = function createBriefing(client, cfg) {
   function onRaw(packet) {
     if (!['MESSAGE_REACTION_ADD', 'MESSAGE_REACTION_REMOVE', 'MESSAGE_REACTION_REMOVE_ALL', 'MESSAGE_REACTION_REMOVE_EMOJI', 'MESSAGE_DELETE'].includes(packet.t)) return;
     if (packet.d?.channel_id !== ids.absenceChannel) return;
+    if (packet.d.message_id) absCache.delete(packet.d.message_id); // реакции на этом сообщении изменились — перепроверим
+    else if (packet.d.id) absCache.delete(packet.d.id);
     if (!['scheduled', 'ready', 'running'].includes(S.phase)) return;
     clearTimeout(debounce);
     debounce = setTimeout(() => syncAbsences().catch(() => {}), 800);
@@ -844,17 +873,19 @@ module.exports = function createBriefing(client, cfg) {
     S.phase = 'ended';
     S.endedAt = Date.now();
     clearTimeout(debounce);
+    for (let w = 0; syncing && w < 50; w++) await sleep(100); // дожидаемся уже идущей проверки, чтобы итог был точным
     const excusedMap = await syncAbsences(S.endedAt);
     persist();
 
-    // 1) Переносим всех из канала брифинга (кроме руководства), снимая заглушки
+    // 1) Люди для переноса / снятия заглушек (сам перенос запускаем ниже, параллельно со списками)
     const dest = ids.afterVoice || undefined; // пусто — никого не переносим, только снимаем заглушки
+    const moveJobs = [];
     for (const m of humansInBrief()) {
       if (isController(m)) continue;
       const opts = { channel: dest, mute: S.muted ? false : undefined, deaf: S.deafened ? false : undefined };
       if (opts.channel === undefined && opts.mute === undefined && opts.deaf === undefined) continue;
-      await m.edit(opts).catch(() => {});
-      await sleep(150);
+      if (dest === undefined && !((opts.mute === false && m.voice.serverMute) || (opts.deaf === false && m.voice.serverDeaf))) continue;
+      moveJobs.push(m.edit(opts).catch(() => {}));
     }
     S.muted = S.deafened = false;
 
@@ -892,14 +923,14 @@ module.exports = function createBriefing(client, cfg) {
     ];
     embeds[0].setAuthor({ name: `Брифинг ${fmtDate(S.startAt)}, ${fmtTime(S.startAt)} (МСК)` });
     const lc = await channel(ids.listsChannel);
-    for (let k = 0; k < embeds.length; k += 10) {
-      await lc?.send({ embeds: embeds.slice(k, k + 10), allowedMentions: { parse: [] } }).catch((e) => console.error('Брифинг: не удалось отправить списки:', e.message));
-    }
+    const sendLists = async () => {
+      for (let k = 0; k < embeds.length; k += 10) { // по порядку, чтобы списки не перемешались
+        await lc?.send({ embeds: embeds.slice(k, k + 10), allowedMentions: { parse: [] } }).catch((e) => console.error('Брифинг: не удалось отправить списки:', e.message));
+      }
+    };
 
-    // 3) Мероприятие, панели
-    await editEvent({ status: GuildScheduledEventStatus.Completed });
-    await syncPanel();
-    await editControl();
+    // 3) Перенос людей, списки, мероприятие и панели — одновременно
+    await Promise.all([Promise.all(moveJobs), sendLists(), editEvent({ status: GuildScheduledEventStatus.Completed }), syncPanel(), editControl()]);
   }
   function chunkEmbeds(title, color, items, footer) {
     const out = [];
@@ -928,13 +959,17 @@ module.exports = function createBriefing(client, cfg) {
       ...(S.absent ?? []).map((uid) => ({ uid, reason: 'Отсутствие на брифинге' })),
       ...(S.lowAttend ?? []).map((x) => ({ uid: x.id, reason: x.reason })),
     ];
+    const jobs = [];
     for (const { uid, reason } of targets) {
       if (isControllerId(uid)) { skipped++; continue; } // руководству выговор ботом не выдаётся
-      const c = pings.createPred(uid, i.user.id, reason);
+      const c = pings.createPred(uid, i.user.id, reason); // выговор записывается сразу
       given++;
-      const ok = await pings.sendDM(uid, { embeds: [pings.punishEmbed(c, guild)] });
-      if (!ok) dmFail++;
-      await sleep(250);
+      jobs.push({ uid, c });
+    }
+    // ЛС рассылаем небольшими пачками одновременно (вместо паузы 250 мс на каждого)
+    for (let k = 0; k < jobs.length; k += 5) {
+      const res = await Promise.all(jobs.slice(k, k + 5).map(({ uid, c }) => pings.sendDM(uid, { embeds: [pings.punishEmbed(c, guild)] })));
+      dmFail += res.filter((ok) => !ok).length;
     }
     await editControl();
     await i.editReply({
@@ -991,7 +1026,7 @@ module.exports = function createBriefing(client, cfg) {
 
     client.on('raw', onRaw);
     client.on('voiceStateUpdate', (o, n) => onVoiceUpdate(o, n).catch((e) => console.error('Брифинг: войс:', e.message)));
-    setInterval(tick, 15_000);
+    setInterval(tick, 5_000); // проверка времени каждые 5 секунд — «Пора начинать» появляется почти сразу
     reconcileSessions();
     await tick(); // tick восстанавливает панель и управление; при сбое повторит через 15 секунд.
   }
