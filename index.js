@@ -107,6 +107,7 @@ const {
   PermissionsBitField,
   MessageFlags,
   SlashCommandBuilder,
+  ActivityType,
   AttachmentBuilder,
   Options,
 } = require('discord.js');
@@ -118,7 +119,7 @@ const GUILD_ID = '1562580237601210518'; // сервер Russia Mafia
 const FEATURES = {
   roster: true, // «Авторитеты»: список состава по рангам
   tickets: true, // тикеты (жалобы, предложения, вопросы)
-  privateRooms: false, // приватные комнаты (пока нет каналов)
+  privateRooms: true, // приватные комнаты
   briefing: true, // брифинги
   predSync: false, // сверка выговоров с игрой (пока нет каналов)
   curatorCalls: true, // вызов в кабинет Отца
@@ -210,6 +211,8 @@ function rankFromRoles(member, entry) {
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent], // MessageContent — чтобы бот видел текст сообщений для транскриптов тикетов
   allowedMentions: { parse: [] },
+  // Статус бота (флаг — прямо в тексте, бот не может ставить эмодзи в кастомный статус отдельно)
+  presence: { status: 'online', activities: [{ type: ActivityType.Custom, name: 'Custom Status', state: '🇷🇺 Russia Мама! Она такая!' }] },
   // Длинные таймауты и повторы запросов — бот переживает кратковременные сбои сети хостинга
   rest: { timeout: 30_000, retries: 5 },
   // Не храним в памяти лишнее (сообщения, реакции, голос, треды и т.п.) — бот ими не пользуется
@@ -2579,8 +2582,8 @@ function pruneModCases() {
 
 // ===================== ПРИВАТНЫЕ КОМНАТЫ =====================
 // Отдельный модуль privaterooms.js: зашёл в лобби — бот создаёт твой голосовой канал в категории
-const PRIVATE_CATEGORY_ID = ''; // !!! категория, где создаются комнаты (нужно для FEATURES.privateRooms)
-const PRIVATE_LOBBY_ID = ''; // !!! канал-«лобби»: зайти сюда = создать комнату (нужно для FEATURES.privateRooms)
+const PRIVATE_CATEGORY_ID = '1563667688746651865'; // категория «приватные комнаты»: права комнаты копируются с неё
+const PRIVATE_LOBBY_ID = '1563667796338937967'; // канал «создание комнаты»: зайти сюда = создать комнату
 const privateRooms = require('./privaterooms')(client, {
   guildId: GUILD_ID,
   categoryId: PRIVATE_CATEGORY_ID,
