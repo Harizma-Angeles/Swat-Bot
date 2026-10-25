@@ -418,7 +418,7 @@ function rosterBlocks(guild) {
     blocks.push({
       title: `${rank} ранг`,
       count: members.length,
-      lines: members.length ? members.map((m) => `<@${m.id}> — \`${getEntry(m.id)?.nick || m.displayName}\``) : ['*На данном ранге никого нет.*'],
+      lines: members.length ? members.map((m) => { const e = getEntry(m.id); return `<@${m.id}> — \`${e?.nick || m.displayName}\`` + (e?.callsign ? ` — кличка **${e.callsign}**` : ''); }) : ['*На данном ранге никого нет.*'],
     });
   }
   return blocks;
