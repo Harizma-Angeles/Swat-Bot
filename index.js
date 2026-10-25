@@ -115,17 +115,17 @@ const GUILD_ID = '1562580237601210518'; // сервер Russia Mafia
 
 // Что включено на этом сервере. Остальные системы включим, когда для них будут готовы каналы и роли.
 const FEATURES = {
-  roster: false, // список руководителей
-  tickets: false, // жалобы
-  privateRooms: false, // приватные комнаты
-  briefing: false, // брифинги
-  predSync: false, // сверка выговоров с игрой
-  curatorCalls: false, // вызов в кабинет
+  roster: true, // «Авторитеты»: список состава по рангам
+  tickets: true, // тикеты (жалобы, предложения, вопросы)
+  privateRooms: false, // приватные комнаты (пока нет каналов)
+  briefing: true, // брифинги
+  predSync: false, // сверка выговоров с игрой (пока нет каналов)
+  curatorCalls: true, // вызов в кабинет Отца
 };
 
 // !!! ВПИШИТЕ ID каналов (правый клик по каналу → «Копировать ID»)
-const REQUEST_CHANNEL_ID = ''; // канал с кнопкой запроса роли
-const REVIEW_CHANNEL_ID = ''; // канал, куда приходят заявки
+const REQUEST_CHANNEL_ID = '1563657813597618257'; // запросы ролей: канал с кнопкой
+const REVIEW_CHANNEL_ID = '1563745203209244672'; // выдача ролей: сюда приходят заявки
 
 // Роли рангов 1–10. В заявке можно выбрать ранги 1–8 (9 и 10 выдаются вручную).
 const RANK_ROLES = {
@@ -145,6 +145,9 @@ const MAX_REQUEST_RANK = 8;
 const EMPLOYEE_ROLE_ID = '1563681939087556648'; // роль «Сотрудник» — выдаётся всем
 const FRIEND_ROLE_ID = '1563681608215568435'; // роль «Друг организации»
 const OP_ROLE_ID = '1562580468660965438'; // OP: доверенное лицо, высшая роль (всё доступно, наказания к ней не применяются)
+const STAR_ROLE_ID = '1563682596272218232'; // роль «*» (звезда): администратор, ниже OP — доступ ко всем кнопкам
+// Кто может нажимать кнопки во всех системах: OP, 9 и 10 ранги, «*»
+const BUTTON_ROLES = [...new Set([OP_ROLE_ID, RANK_ROLES[9], RANK_ROLES[10], STAR_ROLE_ID])];
 
 // Лимиты ника на сервере: «Кличка | Ник [ранг]»
 const NICK_LIMIT = 32; // лимит Discord
@@ -158,7 +161,7 @@ const REQUEST_TYPES = {
 };
 
 // Канал приветствий и прощаний (пусто — приветствий нет)
-const WELCOME_CHANNEL_ID = '';
+const WELCOME_CHANNEL_ID = '1563655522467454996'; // проходная: приветствия и прощания
 
 // Роль, которая выдаётся каждому новому участнику при заходе (пусто — не выдавать)
 const NEWCOMER_ROLE_ID = '';
@@ -169,15 +172,12 @@ const isRankRoleId = (id) => Object.values(RANK_ROLES).includes(id);
 const hasRankRole = (member) => member.roles.cache.some((r) => isRankRoleId(r.id));
 
 // Список руководителей (пока отключён)
-const ROSTER_CHANNEL_ID = '';
+const ROSTER_CHANNEL_ID = '1563656660071751822'; // авторитеты: состав по рангам
 const ROSTER_INTERVAL_MS = 10 * 60 * 1000; // каждые 10 минут
-const ROSTER_TITLE = 'Состав руководителей';
-const ROSTER_LINE = '—————————————————';
-const ROSTER_LEADERS = [];
-const ROSTER_HEADS = [];
+const ROSTER_TITLE = 'Авторитеты';
 
 // Кто может нажимать «Выдать роль» / «Отказать» и пользоваться командами модерации
-const MODERATOR_ROLES = [OP_ROLE_ID];
+const MODERATOR_ROLES = BUTTON_ROLES;
 
 const COLORS = {
   main: 0x4da6ff, // голубой
@@ -309,7 +309,7 @@ const commands = [
     .setName('addrest')
     .setDescription('Записать игровой ник игрока в реестр (по нему бот ставит ник «ОТДЕЛ | Ник»)')
     .addUserOption((o) => o.setName('игрок').setDescription('Пинг игрока').setRequired(true))
-    .addStringOption((o) => o.setName('ник').setDescription('Игровой ник, например Harizma_Angeles').setRequired(true).setMaxLength(40))
+    .addStringOption((o) => o.setName('ник').setDescription('Игровой ник, например Nick_Name').setRequired(true).setMaxLength(40))
     .addStringOption((o) => o.setName('позывной').setDescription('Позывной (необязательно, хранится в реестре)').setRequired(false).setMaxLength(30))
     .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
   new SlashCommandBuilder()
@@ -377,24 +377,52 @@ async function loadMembers(guild) {
   return membersFetching;
 }
 
-// ---------- Список руководителей ----------
-function rosterLines(guild, sections) {
-  const lines = [];
-  for (const sec of sections) {
-    const role = guild.roles.cache.get(sec.roleId);
-    const members = role ? [...role.members.values()].sort((a, b) => a.displayName.localeCompare(b.displayName)) : [];
-    if (!members.length) {
-      lines.push(`**${sec.title}** — *вакантно*`);
-      continue;
-    }
-    for (const m of members) lines.push(`**${sec.title}** — <@${m.id}> — \`${getEntry(m.id)?.nick || m.displayName}\``);
+// ---------- Авторитеты: весь состав по рангам (10 → 1) ----------
+/** Блоки «ранг → участники». Ранг участника определяется по ролям (если роль общая у нескольких рангов — по реестру). */
+function rosterBlocks(guild) {
+  const byRank = new Map();
+  for (let r = 10; r >= 1; r--) byRank.set(r, []);
+  for (const m of guild.members.cache.values()) {
+    if (m.user.bot) continue;
+    const r = rankFromRoles(m, getEntry(m.id));
+    if (r && byRank.has(r)) byRank.get(r).push(m);
   }
-  return lines.join('\n');
+  const blocks = [];
+  for (const [rank, members] of byRank) {
+    members.sort((a, b) => a.displayName.localeCompare(b.displayName, 'ru'));
+    blocks.push({
+      title: `${rank} ранг`,
+      count: members.length,
+      lines: members.length ? members.map((m) => `<@${m.id}> — \`${getEntry(m.id)?.nick || m.displayName}\``) : ['*На данном ранге никого нет.*'],
+    });
+  }
+  return blocks;
+}
+
+/** Режет блоки на страницы, чтобы каждая влезала в описание embed (лимит Discord 4096 символов). */
+function rosterPages(guild) {
+  const LIMIT = 3800;
+  const pages = [];
+  let cur = '';
+  const flush = () => { if (cur) pages.push(cur); cur = ''; };
+  for (const b of rosterBlocks(guild)) {
+    const head = `### ${b.title}${b.count ? ` — ${b.count}` : ''}`;
+    if (cur && cur.length + head.length + b.lines[0].length + 4 > LIMIT) flush();
+    cur += (cur ? '\n\n' : '') + head;
+    for (const line of b.lines) {
+      if (cur.length + line.length + 1 > LIMIT) {
+        flush();
+        cur = `### ${b.title} (продолжение)`;
+      }
+      cur += '\n' + line;
+    }
+  }
+  flush();
+  return pages;
 }
 
 let rosterRunning = false;
-let rosterMsgId = null;
-let rosterLastDesc = '';
+let rosterLastKey = '';
 let rosterLastAt = 0;
 async function updateRoster() {
   if (!FEATURES.roster || !ROSTER_CHANNEL_ID) return;
@@ -404,40 +432,40 @@ async function updateRoster() {
     const guild = client.guilds.cache.get(GUILD_ID);
     if (!guild) return;
     const channel = await client.channels.fetch(ROSTER_CHANNEL_ID).catch(() => null);
-    if (!channel) return console.error('Канал списка руководителей не найден!');
+    if (!channel) return console.error('Канал «Авторитеты» не найден!');
 
     await loadMembers(guild);
 
-    const description =
-      `${ROSTER_LINE}\n${rosterLines(guild, ROSTER_LEADERS)}\n${ROSTER_LINE}\n` +
-      `### Главы отделов\n${ROSTER_LINE}\n${rosterLines(guild, ROSTER_HEADS)}\n${ROSTER_LINE}`;
+    const pages = rosterPages(guild);
+    const key = pages.join('\u0000');
+    // Ничего не изменилось — не трогаем Discord (раз в час всё равно проверяем, что сообщения на месте)
+    if (key === rosterLastKey && Date.now() - rosterLastAt < 60 * 60 * 1000) return;
 
-    // Ничего не изменилось — не трогаем Discord (раз в час всё равно проверяем, что сообщение на месте)
-    if (description === rosterLastDesc && Date.now() - rosterLastAt < 60 * 60 * 1000) return;
+    const embeds = pages.map((text, k) => {
+      const e = new EmbedBuilder()
+        .setColor(COLORS.main)
+        .setTitle(pages.length > 1 ? `${ROSTER_TITLE} (${k + 1}/${pages.length})` : ROSTER_TITLE)
+        .setDescription(text);
+      if (k === pages.length - 1) e.setFooter({ text: 'Список обновляется автоматически' }).setTimestamp();
+      return e;
+    });
 
-    const embed = new EmbedBuilder()
-      .setColor(COLORS.main)
-      .setTitle(ROSTER_TITLE)
-      .setDescription(description)
-      .setFooter({ text: 'Список обновляется автоматически каждые 10 минут' })
-      .setTimestamp();
-
-    const payload = { embeds: [embed], allowedMentions: { parse: [] } };
-    let done = false;
-    if (rosterMsgId) {
-      done = await withRetry(() => channel.messages.edit(rosterMsgId, payload)).then(() => true, () => false);
-      if (!done) rosterMsgId = null;
+    // Наши прежние сообщения списка — по порядку; лишние удаляем, недостающие добавляем
+    const messages = await withRetry(() => channel.messages.fetch({ limit: 50 }));
+    const mine = [...messages.values()]
+      .filter((m) => m.author.id === client.user.id && m.embeds[0]?.title?.startsWith(ROSTER_TITLE))
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    for (let k = 0; k < embeds.length; k++) {
+      const payload = { embeds: [embeds[k]], allowedMentions: { parse: [] } };
+      if (mine[k]) await withRetry(() => mine[k].edit(payload));
+      else await withRetry(() => channel.send(payload));
     }
-    if (!done) {
-      const messages = await withRetry(() => channel.messages.fetch({ limit: 30 }));
-      const existing = messages.find((m) => m.author.id === client.user.id && m.embeds[0]?.title === ROSTER_TITLE);
-      const msg = existing ? await existing.edit(payload) : await channel.send(payload);
-      rosterMsgId = msg.id;
-    }
-    rosterLastDesc = description;
+    for (const extra of mine.slice(embeds.length)) await extra.delete().catch(() => {});
+
+    rosterLastKey = key;
     rosterLastAt = Date.now();
   } catch (err) {
-    console.error('Не удалось обновить список руководителей:', isNetworkError(err) ? 'нет связи с Discord' : err.message);
+    console.error('Не удалось обновить «Авторитеты»:', isNetworkError(err) ? 'нет связи с Discord' : err.message);
   } finally {
     rosterRunning = false;
   }
@@ -636,7 +664,7 @@ client.on('guildMemberAdd', async (member) => {
   await sendWelcomeChannel(member.guild, { embeds: [embed], mentionUser: member.id, content: `<@${member.id}>` });
 });
 
-const ROSTER_ROLE_IDS = new Set([...ROSTER_LEADERS, ...ROSTER_HEADS].map((x) => x.roleId));
+const ROSTER_ROLE_IDS = new Set(Object.values(RANK_ROLES));
 let rosterTimer = null;
 const scheduleRoster = () => {
   clearTimeout(rosterTimer);
@@ -657,6 +685,7 @@ client.on('guildMemberUpdate', async (oldM, newM) => {
 });
 
 client.on('guildMemberRemove', async (member) => {
+  if (member.guild.id === GUILD_ID && member.roles?.cache && hasRankRole(member)) scheduleRoster(); // ушёл участник с рангом — обновляем «Авторитеты»
   if (member.guild.id !== GUILD_ID || member.user?.bot) return;
   if ([...ROSTER_ROLE_IDS].some((id) => member.roles?.cache?.has(id))) scheduleRoster();
 
@@ -688,7 +717,7 @@ client.on('interactionCreate', async (i) => {
       return;
     }
 
-    // Вызовы в кабинет куратора
+    // Вызовы в кабинет Отца
     if (curatorCalls.owns(i)) return await curatorCalls.handle(i);
 
     // Брифинги (кнопки и формы с префиксом br_)
@@ -1125,9 +1154,9 @@ client.on('interactionCreate', async (i) => {
     // Модалка причины отказа
     if (i.isModalSubmit() && i.customId.startsWith('deny_modal:')) return await handleDenySubmit(i);
 
-    // Жалобы (тикеты)
-    if (i.isButton() && i.customId === 'ticket_open') return await showTicketModal(i);
-    if (i.isModalSubmit() && i.customId === 'ticket_modal') return await handleTicketSubmit(i);
+    // Тикеты
+    if (i.isButton() && i.customId.startsWith('ticket_open')) return await showTicketModal(i);
+    if (i.isModalSubmit() && i.customId.startsWith('ticket_modal')) return await handleTicketSubmit(i);
     if (i.isButton() && i.customId === 'ticket_claim') return await handleTicketClaim(i);
     if (i.isButton() && i.customId === 'ticket_close') return await showTicketCloseModal(i);
     if (i.isModalSubmit() && i.customId === 'ticket_close_modal') return await handleTicketCloseSubmit(i);
@@ -1519,12 +1548,12 @@ async function finishRequest(i, { ok, title, verdict, reason, dmOk, nick }) {
   setTimeout(() => processing.delete(i.message.id), 10 * 60 * 1000).unref?.(); // кнопок уже нет — замок больше не нужен
 }
 
-// ===================== ТИКЕТЫ-ЖАЛОБЫ =====================
-const TICKET_PANEL_CHANNEL_ID = '1557891643015958538'; // канал с кнопкой «Подать жалобу»
-const TICKET_CATEGORY_ID = '1557893591848984636'; // раздел, где создаются тикеты
-const TICKET_LOG_CHANNEL_ID = '1557891365948493894'; // логи жалоб
-const TICKET_STAFF_ROLES = ['1553158717787340971', '1553158349317742653']; // пингуются и работают с кнопками
-const TICKET_EXTRA_ID = '1440272013028626475'; // тоже может нажимать кнопки (роль или пользователь)
+// ===================== ТИКЕТЫ =====================
+const TICKET_PANEL_CHANNEL_ID = '1563661934547439757'; // тикеты: канал с кнопками
+const TICKET_CATEGORY_ID = '1563668635719958629'; // раздел, где создаются тикеты
+const TICKET_LOG_CHANNEL_ID = '1563662242413678593'; // канал уведомлений: логи тикетов
+const TICKET_STAFF_ROLES = [OP_ROLE_ID, RANK_ROLES[9], RANK_ROLES[10]]; // пингуются и работают с кнопками
+const TICKET_EXTRA_ID = STAR_ROLE_ID; // роль «*» тоже работает с тикетами (не пингуется)
 
 const ticketStore = makeStore(path.join(DATA_DIR, 'tickets.json'), () => ({ counter: 0, tickets: {} }));
 const ticketDb = ticketStore.data;
@@ -1537,25 +1566,35 @@ const ticketLocks = new Set(); // id каналов, чьи кнопки уже 
 const canUseTicket = (member) =>
   !!member && (member.id === TICKET_EXTRA_ID || member.roles.cache.some((r) => TICKET_STAFF_ROLES.includes(r.id) || r.id === TICKET_EXTRA_ID));
 
+// Типы тикетов. Для каждого — своя форма; канал тикета называется ticket-<slug>-0001
+const TICKET_TYPES = {
+  complaint: { label: 'Жалоба на игрока', emoji: '🚨', slug: 'player', style: ButtonStyle.Danger, color: COLORS.warn },
+  suggestion: { label: 'Предложение', emoji: '💡', slug: 'idea', style: ButtonStyle.Success, color: COLORS.ok },
+  question: { label: 'Вопрос', emoji: '❓', slug: 'question', style: ButtonStyle.Primary, color: COLORS.main },
+};
+const ticketTypeOf = (key) => TICKET_TYPES[key] ?? TICKET_TYPES.complaint;
+
 function ticketPanelPayload() {
   const embed = new EmbedBuilder()
-    .setColor(COLORS.no)
-    .setTitle('🚨 ЖАЛОБА НА ИГРОКА')
+    .setColor(COLORS.main)
+    .setTitle('🎫 ТИКЕТЫ')
     .setDescription(
-      'Столкнулись с нарушением? Вы можете подать жалобу на игрока.\n\n' +
+      'Нужна помощь администрации? Выберите тип обращения кнопкой ниже.\n\n' +
+        '**Типы тикетов:**\n' +
+        '> 🚨 **Жалоба на игрока** — нарушение правил (нужна ссылка на видео-доказательство)\n' +
+        '> 💡 **Предложение** — идея, как улучшить организацию или сервер\n' +
+        '> ❓ **Вопрос** — вопрос к администрации\n\n' +
         '**Как это работает:**\n' +
-        '> 1️⃣ Нажмите кнопку ниже\n' +
-        '> 2️⃣ Заполните форму:\n' +
-        '> • инициатор наказания\n' +
-        '> • нарушитель\n' +
-        '> • суть нарушения\n' +
-        '> • доказательство (ссылка на видео)\n' +
-        '> 3️⃣ Бот создаст отдельный тикет, где жалобу рассмотрит администрация\n' +
+        '> 1️⃣ Нажмите кнопку нужного типа\n' +
+        '> 2️⃣ Заполните форму\n' +
+        '> 3️⃣ Бот создаст отдельный тикет, где ваше обращение рассмотрит администрация\n' +
         '> 4️⃣ О закрытии тикета вы получите уведомление в личные сообщения'
     )
-    .setFooter({ text: 'Russia Mafia • Жалобы' });
+    .setFooter({ text: 'Russia Mafia • Тикеты' });
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket_open').setLabel('Подать жалобу').setStyle(ButtonStyle.Danger).setEmoji('📨')
+    ...Object.entries(TICKET_TYPES).map(([key, t]) =>
+      new ButtonBuilder().setCustomId(`ticket_open:${key}`).setLabel(t.label).setStyle(t.style).setEmoji(t.emoji)
+    )
   );
   return { embeds: [embed], components: [row] };
 }
@@ -1563,15 +1602,18 @@ function ticketPanelPayload() {
 async function ensureTicketPanel() {
   if (!FEATURES.tickets) return;
   const channel = await client.channels.fetch(TICKET_PANEL_CHANNEL_ID).catch(() => null);
-  if (!channel) return console.error('Канал жалоб не найден!');
+  if (!channel) return console.error('Канал тикетов не найден!');
   const messages = await withRetry(() => channel.messages.fetch({ limit: 30 })).catch(() => null);
-  if (!messages) return console.error('Не удалось проверить панель жалоб (нет связи) — новую не создаю, чтобы не было дублей.');
-  const exists = messages.some(
-    (m) => m.author.id === client.user.id && m.components.some((r) => r.components.some((c) => c.customId === 'ticket_open'))
+  if (!messages) return console.error('Не удалось проверить панель тикетов (нет связи) — новую не создаю, чтобы не было дублей.');
+  const existing = messages.find(
+    (m) => m.author.id === client.user.id && m.components.some((r) => r.components.some((c) => String(c.customId).startsWith('ticket_open')))
   );
-  if (!exists) {
+  if (!existing) {
     await withRetry(() => channel.send(ticketPanelPayload()));
-    console.log('Панель жалоб отправлена.');
+    console.log('Панель тикетов отправлена.');
+  } else if (existing.embeds[0]?.title !== '🎫 ТИКЕТЫ') {
+    await withRetry(() => existing.edit(ticketPanelPayload())); // старая панель с одной кнопкой «Подать жалобу» → новая с типами
+    console.log('Панель тикетов обновлена.');
   }
 }
 
@@ -1580,38 +1622,66 @@ async function ticketLog(embed) {
     const ch = await client.channels.fetch(TICKET_LOG_CHANNEL_ID);
     await ch.send({ embeds: [embed], allowedMentions: { parse: [] } });
   } catch (err) {
-    console.error('Не удалось записать лог жалобы:', err.message);
+    console.error('Не удалось записать лог тикета:', err.message);
   }
 }
 
-const ticketName = (n) => `ticket-player-${String(n).padStart(4, '0')}`;
+const ticketName = (n, type = 'complaint') => `ticket-${ticketTypeOf(type).slug}-${String(n).padStart(4, '0')}`;
 
-// Шаг 1: кнопка → форма
+// Шаг 1: кнопка → форма (своя для каждого типа)
 async function showTicketModal(i) {
+  const type = TICKET_TYPES[i.customId.split(':')[1]] ? i.customId.split(':')[1] : 'complaint';
   const field = (id, label, style, placeholder, max) =>
     new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setPlaceholder(placeholder).setRequired(true).setMaxLength(max)
     );
-  const modal = new ModalBuilder()
-    .setCustomId('ticket_modal')
-    .setTitle('Жалоба на игрока')
-    .addComponents(
-      field('initiator', 'Инициатор наказания', TextInputStyle.Short, 'Nick_Name', 40),
-      field('violator', 'Нарушитель', TextInputStyle.Short, 'Nick_Name', 40),
-      field('essence', 'Суть нарушения', TextInputStyle.Paragraph, 'Опишите, что произошло', 1000),
-      field('evidence', 'Доказательство (ссылка на видео)', TextInputStyle.Short, 'https://youtube.com/...', 300)
-    );
+  const rows =
+    type === 'complaint'
+      ? [
+          field('initiator', 'Инициатор наказания', TextInputStyle.Short, 'Nick_Name', 40),
+          field('violator', 'Нарушитель', TextInputStyle.Short, 'Nick_Name', 40),
+          field('essence', 'Суть нарушения', TextInputStyle.Paragraph, 'Опишите, что произошло', 1000),
+          field('evidence', 'Доказательство (ссылка на видео)', TextInputStyle.Short, 'https://youtube.com/...', 300),
+        ]
+      : type === 'suggestion'
+        ? [
+            field('topic', 'Тема предложения', TextInputStyle.Short, 'Коротко, о чём идея', 100),
+            field('essence', 'Ваше предложение', TextInputStyle.Paragraph, 'Опишите идею подробно', 1500),
+          ]
+        : [
+            field('topic', 'Тема вопроса', TextInputStyle.Short, 'Коротко, о чём вопрос', 100),
+            field('essence', 'Ваш вопрос', TextInputStyle.Paragraph, 'Опишите вопрос подробно', 1500),
+          ];
+  const modal = new ModalBuilder().setCustomId(`ticket_modal:${type}`).setTitle(ticketTypeOf(type).label).addComponents(...rows);
   await i.showModal(modal);
+}
+
+/** Поля тикета (для embed в канале тикета и для лога) — разные для разных типов. */
+function ticketContentFields(type, d, authorId) {
+  const author = { name: '👤 Автор', value: `<@${authorId}>`, inline: true };
+  if (type === 'complaint') {
+    return [
+      { name: '👮 Инициатор наказания', value: `\`${d.initiator}\``, inline: true },
+      { name: '⚠️ Нарушитель', value: `\`${d.violator}\``, inline: true },
+      author,
+      { name: '📝 Суть нарушения', value: d.essence },
+      { name: '🎥 Доказательство', value: d.evidence },
+    ];
+  }
+  return [author, { name: '📌 Тема', value: d.topic, inline: true }, { name: type === 'suggestion' ? '💡 Предложение' : '❓ Вопрос', value: d.essence }];
 }
 
 // Шаг 2: создание тикета
 async function handleTicketSubmit(i) {
-  const initiator = i.fields.getTextInputValue('initiator').trim();
-  const violator = i.fields.getTextInputValue('violator').trim();
-  const essence = i.fields.getTextInputValue('essence').trim();
-  const evidence = i.fields.getTextInputValue('evidence').trim();
+  const type = TICKET_TYPES[i.customId.split(':')[1]] ? i.customId.split(':')[1] : 'complaint';
+  const T = ticketTypeOf(type);
+  const val = (id) => i.fields.getTextInputValue(id).trim();
+  const d =
+    type === 'complaint'
+      ? { initiator: val('initiator'), violator: val('violator'), essence: val('essence'), evidence: val('evidence') }
+      : { topic: val('topic'), essence: val('essence') };
 
-  if (!/^https?:\/\/\S+$/i.test(evidence)) {
+  if (type === 'complaint' && !/^https?:\/\/\S+$/i.test(d.evidence)) {
     return i.reply(ephemeral('❌ В поле «Доказательство» нужна ссылка на видео (начинается с http:// или https://). Попробуйте снова.'));
   }
 
@@ -1619,7 +1689,7 @@ async function handleTicketSubmit(i) {
   for (const [chId, t] of Object.entries(ticketDb.tickets)) {
     if (t.userId !== i.user.id || t.status !== 'open') continue;
     if (i.guild.channels.cache.has(chId)) {
-      return i.reply(ephemeral(`❌ У вас уже есть открытая жалоба: <#${chId}>. Дождитесь её рассмотрения.`));
+      return i.reply(ephemeral(`❌ У вас уже есть открытый тикет: <#${chId}>. Дождитесь его рассмотрения.`));
     }
     t.status = 'closed';
     t.deleted = true;
@@ -1632,7 +1702,7 @@ async function handleTicketSubmit(i) {
   // Номер выдаётся синхронно и сразу сохраняется — два тикета не получат один номер
   const number = ++ticketDb.counter;
   saveTickets();
-  const name = ticketName(number);
+  const name = ticketName(number, type);
 
   try {
     const guild = i.guild;
@@ -1663,14 +1733,15 @@ async function handleTicketSubmit(i) {
       name,
       type: ChannelType.GuildText,
       parent: TICKET_CATEGORY_ID,
-      topic: `Жалоба #${String(number).padStart(4, '0')} • автор: ${i.user.id}`,
+      topic: `${T.label} #${String(number).padStart(4, '0')} • автор: ${i.user.id}`,
       permissionOverwrites: overwrites,
-      reason: `Жалоба от ${i.user.tag}`,
+      reason: `${T.label} от ${i.user.tag}`,
     });
 
     ticketDb.tickets[channel.id] = {
       number,
       name,
+      type,
       userId: i.user.id,
       claimedBy: null,
       status: 'open',
@@ -1679,17 +1750,10 @@ async function handleTicketSubmit(i) {
     saveTickets();
 
     const embed = new EmbedBuilder()
-      .setColor(COLORS.warn)
-      .setTitle(`🚨 Жалоба ${name}`)
+      .setColor(T.color)
+      .setTitle(`${T.emoji} ${T.label} — ${name}`)
       .setThumbnail(i.user.displayAvatarURL())
-      .addFields(
-        { name: '👮 Инициатор наказания', value: `\`${initiator}\``, inline: true },
-        { name: '⚠️ Нарушитель', value: `\`${violator}\``, inline: true },
-        { name: '👤 Автор жалобы', value: `<@${i.user.id}>`, inline: true },
-        { name: '📝 Суть нарушения', value: essence },
-        { name: '🎥 Доказательство', value: evidence },
-        { name: '📌 Статус', value: '⏳ Ожидает рассмотрения' }
-      )
+      .addFields(...ticketContentFields(type, d, i.user.id), { name: '📌 Статус', value: '⏳ Ожидает рассмотрения' })
       .setFooter({ text: 'Нажмите «Взять», чтобы начать рассмотрение' })
       .setTimestamp();
 
@@ -1704,20 +1768,13 @@ async function handleTicketSubmit(i) {
       allowedMentions: { roles: TICKET_STAFF_ROLES, users: [i.user.id] },
     });
 
-    await i.editReply(`✅ Жалоба отправлена! Тикет: <#${channel.id}>`);
+    await i.editReply(`✅ Тикет создан: <#${channel.id}>`);
 
     await ticketLog(
       new EmbedBuilder()
-        .setColor(COLORS.warn)
-        .setTitle(`📨 Новая жалоба — ${name}`)
-        .addFields(
-          { name: 'Автор', value: `<@${i.user.id}> (\`${i.user.id}\`)`, inline: true },
-          { name: 'Канал', value: `<#${channel.id}>`, inline: true },
-          { name: 'Инициатор наказания', value: `\`${initiator}\``, inline: true },
-          { name: 'Нарушитель', value: `\`${violator}\``, inline: true },
-          { name: 'Суть нарушения', value: essence },
-          { name: 'Доказательство', value: evidence }
-        )
+        .setColor(T.color)
+        .setTitle(`📨 Новый тикет (${T.label}) — ${name}`)
+        .addFields({ name: 'Канал', value: `<#${channel.id}>`, inline: true }, ...ticketContentFields(type, d, i.user.id))
         .setTimestamp()
     );
   } catch (err) {
@@ -1737,7 +1794,7 @@ async function handleTicketClaim(i) {
   // Сначала запоминаем, кто нажал (синхронно, до любых await), потом обрабатываем
   if (ticketLocks.has(chId) || ticket.claimedBy) {
     const who = ticket.claimedBy ? `<@${ticket.claimedBy}>` : 'другим администратором';
-    return i.reply({ ...ephemeral(`⏳ Жалобу уже взял ${who}.`), allowedMentions: { parse: [] } });
+    return i.reply({ ...ephemeral(`⏳ Тикет уже взял ${who}.`), allowedMentions: { parse: [] } });
   }
   ticketLocks.add(chId);
   ticket.claimedBy = i.user.id;
@@ -1746,7 +1803,7 @@ async function handleTicketClaim(i) {
     const old = i.message.embeds[0];
     const embed = EmbedBuilder.from(old)
       .setColor(COLORS.main)
-      .setFooter({ text: 'Жалоба взята в работу' });
+      .setFooter({ text: 'Тикет взят в работу' });
     const fields = (old.fields ?? []).map((f) => (f.name.includes('Статус') ? { ...f, value: `🔧 В работе — <@${i.user.id}>` } : f));
     embed.setFields(fields);
 
@@ -1758,7 +1815,7 @@ async function handleTicketClaim(i) {
     await ticketLog(
       new EmbedBuilder()
         .setColor(COLORS.main)
-        .setTitle(`✋ Жалоба взята — ${ticket.name}`)
+        .setTitle(`✋ Тикет взят — ${ticket.name}`)
         .addFields(
           { name: 'Взял', value: `<@${i.user.id}> (\`${i.user.id}\`)`, inline: true },
           { name: 'Канал', value: `<#${chId}>`, inline: true }
@@ -1766,11 +1823,11 @@ async function handleTicketClaim(i) {
         .setTimestamp()
     );
   } catch (err) {
-    // откат, чтобы жалобу можно было взять снова
+    // откат, чтобы тикет можно было взять снова
     ticket.claimedBy = null;
     try { saveTickets(); } catch {}
-    console.error('Ошибка при взятии жалобы:', err);
-    if (!i.replied && !i.deferred) i.reply(ephemeral('❌ Не удалось взять жалобу. Попробуйте ещё раз.')).catch(() => {});
+    console.error('Ошибка при взятии тикета:', err);
+    if (!i.replied && !i.deferred) i.reply(ephemeral('❌ Не удалось взять тикет. Попробуйте ещё раз.')).catch(() => {});
   } finally {
     ticketLocks.delete(chId);
   }
@@ -1784,14 +1841,14 @@ async function showTicketCloseModal(i) {
 
   const modal = new ModalBuilder()
     .setCustomId('ticket_close_modal')
-    .setTitle('Закрытие жалобы')
+    .setTitle('Закрытие тикета')
     .addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('reason')
           .setLabel('Причина закрытия')
           .setStyle(TextInputStyle.Paragraph)
-          .setPlaceholder('Например: нарушение подтверждено, наказание выдано')
+          .setPlaceholder('Например: вопрос решён / предложение рассмотрено / наказание выдано')
           .setRequired(true)
           .setMaxLength(500)
       )
@@ -1851,7 +1908,7 @@ async function handleTicketCloseSubmit(i) {
           embeds: [
             new EmbedBuilder()
               .setColor(COLORS.no)
-              .setTitle('🔒 Жалоба закрыта')
+              .setTitle('🔒 Тикет закрыт')
               .setDescription(`Закрыл: <@${i.user.id}>\n**Причина:** ${reason}\n\nКанал будет удалён через 10 секунд.`),
           ],
           allowedMentions: { parse: [] },
@@ -1868,7 +1925,7 @@ async function handleTicketCloseSubmit(i) {
       }
     }
 
-    // ЛС автору жалобы
+    // ЛС автору тикета
     const dmOk = await sendDM(ticket.userId, {
       embeds: [
         new EmbedBuilder()
@@ -1884,10 +1941,10 @@ async function handleTicketCloseSubmit(i) {
     await ticketLog(
       new EmbedBuilder()
         .setColor(COLORS.no)
-        .setTitle(`🔒 Жалоба закрыта — ${ticket.name}`)
+        .setTitle(`🔒 Тикет закрыт — ${ticket.name}`)
         .addFields(
           { name: 'Закрыл', value: `<@${i.user.id}> (\`${i.user.id}\`)`, inline: true },
-          { name: 'Автор жалобы', value: `<@${ticket.userId}>`, inline: true },
+          { name: 'Автор', value: `<@${ticket.userId}>`, inline: true },
           { name: 'ЛС автору', value: dmOk ? '✅ доставлено' : '❌ закрыты личные сообщения', inline: true },
           { name: 'Причина', value: reason }
         )
@@ -1895,7 +1952,7 @@ async function handleTicketCloseSubmit(i) {
     );
 
     setTimeout(() => {
-      deleteTicketChannel(chId, `Жалоба закрыта: ${i.user.tag}`).finally(() => ticketLocks.delete(chId));
+      deleteTicketChannel(chId, `Тикет закрыт: ${i.user.tag}`).finally(() => ticketLocks.delete(chId));
     }, 10_000);
   } catch (err) {
     console.error('Ошибка закрытия тикета:', err);
@@ -1908,7 +1965,7 @@ async function handleTicketCloseSubmit(i) {
 // Сюда пишутся логи наказаний (ID канала). Пусто — логов в канал не будет.
 const MOD_LOG_CHANNEL_ID = '';
 // Кто может пользоваться командами модерации (кроме администраторов сервера)
-const MOD_COMMAND_ROLES = MODERATOR_ROLES;
+const MOD_COMMAND_ROLES = [OP_ROLE_ID]; // команды модерации — как раньше, только OP (кнопки — см. BUTTON_ROLES)
 
 const DAY = 864e5;
 const MAX_TIMEOUT_MS = 28 * DAY - 60_000; // лимит Discord на один тайм-аут; длинные муты продлеваются автоматически
@@ -2369,8 +2426,8 @@ function pruneModCases() {
 
 // ===================== ПРИВАТНЫЕ КОМНАТЫ =====================
 // Отдельный модуль privaterooms.js: зашёл в лобби — бот создаёт твой голосовой канал в категории
-const PRIVATE_CATEGORY_ID = '1558218636001411214'; // категория, где создаются комнаты
-const PRIVATE_LOBBY_ID = '1558219429676847155'; // канал-«лобби»: зайти сюда = создать комнату
+const PRIVATE_CATEGORY_ID = ''; // !!! категория, где создаются комнаты (нужно для FEATURES.privateRooms)
+const PRIVATE_LOBBY_ID = ''; // !!! канал-«лобби»: зайти сюда = создать комнату (нужно для FEATURES.privateRooms)
 const privateRooms = require('./privaterooms')(client, {
   guildId: GUILD_ID,
   categoryId: PRIVATE_CATEGORY_ID,
@@ -2387,23 +2444,18 @@ const briefing = require('./briefing')(client, {
   colors: COLORS,
   utcOffsetMin: 180, // время брифингов вводится и показывается по МСК (UTC+3)
   ids: {
-    setupChannel: '1558223523460153424', // настройка брифинга (панель и кнопки)
-    newsChannel: '1553158038825861211', // новости (объявления, напоминания)
-    absenceChannel: '1558141619763679262', // неявки
-    listsChannel: '1558217396781842432', // списки явки
-    briefingVoice: '1558178483744800838', // войс брифинга
-    afterVoice: '1555156649017344170', // куда переносить после брифинга
+    setupChannel: '1563746639036948653', // настройка брифинга (панель и кнопки)
+    newsChannel: '1563657379256471643', // новости (объявления, напоминания)
+    absenceChannel: '1563747559753912400', // неявки
+    listsChannel: '1563747403700633720', // логи брифинга: кто когда зашёл, списки явки
+    briefingVoice: '1563746902988558377', // основной войс брифинга
+    afterVoice: '', // !!! куда переносить после брифинга. Пусто — люди остаются на месте; вставьте ID войса, чтобы переносило
   },
   // Кто управляет брифингами. Личный пользователь НЕ пингуется при появлении кнопок.
-  controllerUserIds: ['1440272013028626475'],
-  controllerRoleIds: ['1553158349317742653', '1553158717787340971'], // Куратор SWAT, Зам.Куратора SWAT
-  // Роли, чья явка учитывается
-  attendeeRoleIds: [
-    '1553158349317742653', '1553158717787340971', '1558057372478607360', '1558057222905405492',
-    '1553180446576349184', '1553183740874727514', '1553180447947890859', '1553180389164716052',
-    '1553180332247748628', '1553180126257086514', '1553180207702085822', '1553179974851104878',
-    '1553180054589022228', '1553158492389511278', '1553449584779460711',
-  ],
+  controllerUserIds: [],
+  controllerRoleIds: BUTTON_ROLES, // OP, 9 и 10 ранги, «*»
+  // Роли, чья явка учитывается: все ранги 1–10
+  attendeeRoleIds: [...new Set(Object.values(RANK_ROLES))],
   pings: {
     createPred: (userId, modId, reason) => createCase({ type: 'pred', userId, modId, reason, ms: MOD_TYPES.pred.defaultMs }),
     sendDM,
@@ -2419,27 +2471,27 @@ const predSync = require('./predsync')(client, {
   colors: COLORS,
   port: Number(process.env.SERVER_PORT || process.env.PORT || 4062),
   ids: {
-    alertChannel: '1558579646025564310', // оповещения о расхождениях (с кнопками)
-    tableChannel: '1558586286137413782', // полная таблица сверки игроков
+    alertChannel: '', // !!! оповещения о расхождениях (нужно для FEATURES.predSync)
+    tableChannel: '', // !!! полная таблица сверки игроков (нужно для FEATURES.predSync)
   },
-  controllerUserIds: ['1440272013028626475'],
-  controllerRoleIds: ['1553158349317742653', '1553158717787340971'], // Куратор SWAT, Зам.Куратора SWAT — пингуются и могут жать кнопки
+  controllerUserIds: [],
+  controllerRoleIds: BUTTON_ROLES, // OP, 9 и 10 ранги, «*» — пингуются и могут жать кнопки
   getRegistry: () => Object.keys(nicks).map((id) => [id, getEntry(id)?.nick]),
   countDiscordPreds: (userId) => activeCases(userId, 'pred').length,
 });
 // =========================================================
 
 
-// ===================== КАБИНЕТ КУРАТОРА =====================
+// ===================== КАБИНЕТ ОТЦА =====================
 const curatorCalls = require('./curatorcalls')(client, {
   guildId: GUILD_ID,
   ids: {
-    setupChannel: '1559535472374579220',
-    officeVoice: '1553160581656223821',
-    waitingVoice: '1559535100360654878',
-    logChannel: '1559537571292389446',
+    setupChannel: '1563680137298321539', // настройка кабинета Отца
+    officeVoice: '1563679827863543868', // кабинет Отца (войс)
+    waitingVoice: '1563679791331152012', // ожидание (войс)
+    logChannel: '1563680165928771637', // лог кабинета Отца
   },
-  controllerRoleIds: ['1553158349317742653', '1553158717787340971', '1558125529943642303'],
+  controllerRoleIds: BUTTON_ROLES, // OP, 9 и 10 ранги, «*»
   store: makeStore(path.join(DATA_DIR, 'curator-calls.json'), () => ({})),
   sendDM,
   colors: COLORS,
